@@ -1,0 +1,211 @@
+#!/usr/bin/perl
+# Scale Buildkite agents using existing AWS Spot Fleet Requests.
+# Copyright 2021 Daniel Collins <solemnwarning@solemnwarning.net>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     Redistributions of source code must retain the above copyright notice,
+#     this list of conditions and the following disclaimer.
+#
+#     Redistributions in binary form must reproduce the above copyright notice,
+#     this list of conditions and the following disclaimer in the documentation
+#     and/or other materials provided with the distribution.
+#
+#     Neither the name of the copyright holder nor the names of its contributors
+#     may be used to endorse or promote products derived from this software
+#     without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+use strict;
+use warnings;
+
+my $bsfs = App::BuildkiteSpotFleetScaler->new();
+$bsfs->main();
+
+package App::BuildkiteSpotFleetScaler;
+
+use Data::Compare;
+use IPC::Run qw(run);
+use JSON;
+use List::Compare;
+use List::Util qw(min max);
+use LWP::UserAgent;
+use POSIX qw(ceil);
+
+sub new
+{
+	my ($class) = @_;
+	
+	my $self = {
+		buildkite_organization => ($ENV{BUILDKITE_ORGANIZATION} // die "BUILDKITE_ORGANIZATION not set in environment"),
+		buildkite_api_key      => ($ENV{BUILDKITE_API_KEY}      // die "BUILDKITE_API_KEY not set in environment"),
+		
+		fleets => [],
+	};
+	
+	return bless($self, $class);
+}
+
+sub main
+{
+	my ($self) = @_;
+	
+	# Find any Spot Fleet Requests on AWS with the appropriate tags.
+	$self->get_scalable_spot_fleets();
+	
+	# Query Buildkite to find out how many jobs are waiting for each fleet.
+	$self->read_buildkite_jobs();
+	
+	# Decide how many instances each fleet should be scaled to.
+	$self->calculate_fleet_targets();
+	
+	$self->update_fleet_targets();
+}
+
+sub get_scalable_spot_fleets
+{
+	my ($self) = @_;
+	
+	my $spot_fleet_requests_json;
+	run([ "aws", "ec2", "describe-spot-fleet-requests" ], ">" => \$spot_fleet_requests_json)
+		or die "Unable to fetch Spot Fleet Requests\n";
+	
+	my $spot_fleet_requests = decode_json($spot_fleet_requests_json);
+	
+	foreach my $sfrc(@{ $spot_fleet_requests->{SpotFleetRequestConfigs} })
+	{
+		if($sfrc->{SpotFleetRequestState} eq "active")
+		{
+			my $tags_json;
+			run([ "aws", "ec2", "describe-tags",
+				"--filters", "Name=resource-id,Values=".$sfrc->{SpotFleetRequestId} ],
+				">" => \$tags_json)
+				
+				or do {
+					warn "Unable to fetch tags for Spot Fleet Request", $sfrc->{SpotFleetRequestId}, ", skipping fleet\n";
+					next;
+				};
+			
+			my %tags = map { $_->{Key} => $_->{Value} }
+				@{ decode_json($tags_json)->{Tags} };
+			
+			if($tags{"buildkite-scaler-enable"})
+			{
+				my $meta_data = $tags{"buildkite-agent-meta-data"};
+				
+				push(@{ $self->{fleets} }, {
+					spot_fleet_request_id => $sfrc->{SpotFleetRequestId},
+					current_capacity      => $sfrc->{SpotFleetRequestConfig}->{TargetCapacity},
+					
+					meta_data => [ split(m/,/, $meta_data) ],
+					spawn     => $tags{"buildkite-agent-spawn"},
+					
+					min_capacity => $tags{"buildkite-scaler-min-instances"},
+					max_capacity => $tags{"buildkite-scaler-max-instances"},
+					
+					matching_jobs => 0,
+				});
+			}
+		}
+	}
+}
+
+sub read_buildkite_jobs
+{
+	my ($self) = @_;
+	
+	# Get a list of all running/scheduled builds.
+	my @builds = do {
+		my $ua = LWP::UserAgent->new(
+			env_proxy => 1,
+		);
+		
+		my $response = $ua->get(
+			"https://api.buildkite.com/v2/organizations/".$self->{buildkite_organization}."/builds?state[]=scheduled&state[]=running",
+			"Authorization" => "Bearer ".$self->{buildkite_api_key});
+		
+		if($response->code() != 200)
+		{
+			die "Got HTTP code ", $response->code(), "\n", $response->content(), "\n";
+		}
+		
+		@{ decode_json($response->content()) }
+	};
+	
+	# Extract all running/scheduled jobs ("steps") from the list of builds, since
+	# they're what actually get allocated to agents.
+	my @jobs = grep { $_->{type} eq "script" && ($_->{state} eq "scheduled" || $_->{state} eq "running") }
+		map { @{ $_->{jobs} } } @builds;
+	
+	# Iterate over the jobs and count how many can be handled by each fleet.
+	# BUG: If multiple fleets can satisfy a job, only the first will be used.
+	JOB: foreach my $job(@jobs)
+	{
+		foreach my $fleet(@{ $self->{fleets} })
+		{
+			if(@{ $job->{agent_query_rules}} && List::Compare->new($job->{agent_query_rules}, $fleet->{meta_data})->is_LsubsetR())
+			{
+				# This fleet provides everything in the job's agent_query_rules.
+				($fleet->{matching_jobs})++;
+				
+				next JOB;
+			}
+		}
+	}
+}
+
+sub calculate_fleet_targets
+{
+	my ($self) = @_;
+	
+	# Calculate the target capacity of each fleet.
+	foreach my $fleet(@{ $self->{fleets} })
+	{
+		my $target_capacity = ceil($fleet->{matching_jobs} / $fleet->{spawn});
+		
+		my $want = $target_capacity;
+		
+		# Don't reduce the fleet size if there are any remaining jobs running
+		# on it in case one the instance running it is chosen to be terminated.
+		if($fleet->{matching_jobs} > 0)
+		{
+			$target_capacity = max($target_capacity, $fleet->{current_capacity});
+		}
+		
+		# Clamp fleet size.
+		$target_capacity = max($target_capacity, $fleet->{min_capacity});
+		$target_capacity = min($target_capacity, $fleet->{max_capacity});
+		
+		$fleet->{target_capacity} = $target_capacity;
+	}
+}
+
+sub update_fleet_targets
+{
+	my ($self) = @_;
+	
+	foreach my $fleet(@{ $self->{fleets} })
+	{
+		if($fleet->{target_capacity} != $fleet->{current_capacity})
+		{
+			run([ "aws", "ec2", "modify-spot-fleet-request",
+				"--spot-fleet-request-id" => $fleet->{spot_fleet_request_id},
+				"--target-capacity" => $fleet->{target_capacity} ],
+				">" => "/dev/null")
+				
+				or warn "Unable to update spot fleet request ", $fleet->{spot_fleet_request_id}, " target capacity\n";
+		}
+	}
+}
