@@ -115,6 +115,8 @@ sub get_scalable_spot_fleets
 					min_capacity => $tags{"buildkite-scaler-min-instances"},
 					max_capacity => $tags{"buildkite-scaler-max-instances"},
 					
+					terminate => !!($tags{"buildkite-scaler-terminate-on-scale-down"}),
+					
 					matching_jobs => 0,
 				});
 			}
@@ -179,7 +181,7 @@ sub calculate_fleet_targets
 		
 		# Don't reduce the fleet size if there are any remaining jobs running
 		# on it in case one the instance running it is chosen to be terminated.
-		if($fleet->{matching_jobs} > 0)
+		if($fleet->{terminate} && $fleet->{matching_jobs} > 0)
 		{
 			$target_capacity = max($target_capacity, $fleet->{current_capacity});
 		}
@@ -202,7 +204,8 @@ sub update_fleet_targets
 		{
 			run([ "aws", "ec2", "modify-spot-fleet-request",
 				"--spot-fleet-request-id" => $fleet->{spot_fleet_request_id},
-				"--target-capacity" => $fleet->{target_capacity} ],
+				"--target-capacity" => $fleet->{target_capacity},
+				"--excess-capacity-termination-policy" => ($fleet->{terminate} ? "default" : "noTermination") ],
 				">" => "/dev/null")
 				
 				or warn "Unable to update spot fleet request ", $fleet->{spot_fleet_request_id}, " target capacity\n";

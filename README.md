@@ -65,6 +65,11 @@ buildkite-scaler-max-instances = "2"
 
 # Enable the scaler on this fleet.
 buildkite-scaler-enable = "1"
+
+# Automatically terminate agents when there is no work (optional).
+# NOTE: This is prone to race conditions. I suggest leaving this disabled and designing the agent
+# AMIs so that they shut themselves down when idle instead.
+buildkite-scaler-terminate-on-scale-down = "1"
 ```
 
 Set `BUILDKITE_ORGANIZATION` and `BUILDKITE_API_KEY` in the environment and run the `buildkite-spot-fleet-scaler` script with no arguments. The script will update the fleet target capacities as necessary once and then exit. Run it from cron or another part of your automation pipeline.
