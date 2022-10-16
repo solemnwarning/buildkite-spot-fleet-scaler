@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Scale Buildkite agents using existing AWS Spot Fleet Requests.
-# Copyright 2021 Daniel Collins <solemnwarning@solemnwarning.net>
+# Copyright 2021-2022 Daniel Collins <solemnwarning@solemnwarning.net>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -135,7 +135,7 @@ sub read_buildkite_jobs
 		);
 		
 		my $response = $ua->get(
-			"https://api.buildkite.com/v2/organizations/".$self->{buildkite_organization}."/builds?state[]=scheduled&state[]=running",
+			"https://api.buildkite.com/v2/organizations/".$self->{buildkite_organization}."/builds?state[]=scheduled&state[]=running&state[]=failing",
 			"Authorization" => "Bearer ".$self->{buildkite_api_key});
 		
 		if($response->code() != 200)
